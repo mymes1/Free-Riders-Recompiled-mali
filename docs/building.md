@@ -107,9 +107,12 @@ then install from the app's launcher. Hold Back to leave the game. Details and
 limits: [android.md](android.md).
 
 A machine without the NDK can still build the APK: the **android apk** workflow
-does it on a GitHub runner from the game code you generated and pushed to a
-private repository of your own ([android-apk-workflow.md](android-apk-workflow.md)).
-The NDK and Java are the runner's, and your disc image is never involved.
+does it on a GitHub runner, installing its own SDK, NDK, CMake and Ninja
+([android-apk-workflow.md](android-apk-workflow.md)). It is handed the two
+things only your machine can make — `out/recomp/diagnostic` and
+`out/shaders/shaders.pack` — as one zip (`python scripts/package_sources.py`,
+shared by a link) or in a private repository; the runner downloads and checks
+them with `scripts/fetch_sources.py`. Your disc image is never involved.
 
 ## Tests
 

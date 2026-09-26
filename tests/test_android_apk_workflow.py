@@ -135,7 +135,7 @@ class AndroidApkWorkflowTests(unittest.TestCase):
 
     @unittest.skipUnless(SHELL, 'the steps are shell scripts')
     def test_the_sources_check_reads_the_layout_it_documents(self):
-        block = self.steps['Check the game code and the shader pack']
+        block = self.steps['Check the game code that arrived']
         values = {'inputs.game_directory': 'out/recomp/diagnostic',
                   'inputs.shaders_pack': 'out/shaders/shaders.pack'}
         with tempfile.TemporaryDirectory() as directory:
@@ -163,8 +163,8 @@ class AndroidApkWorkflowTests(unittest.TestCase):
         libraries = ('libmain.so', 'liblauncher.so', 'libSDL2.so', 'libc++_shared.so')
         entries = ['classes.dex', 'assets/shaders.pack']
         entries += ['lib/arm64-v8a/' + library for library in libraries]
-        values = {'inputs.sources_repo': 'someone/sources', 'inputs.sources_ref': '',
-                  'inputs.game_directory': 'out/recomp/diagnostic',
+        values = {'inputs.sources_url': '', 'inputs.sources_repo': 'someone/sources',
+                  'inputs.sources_ref': '', 'inputs.game_directory': 'out/recomp/diagnostic',
                   'inputs.shaders_pack': 'out/shaders/shaders.pack', 'inputs.abi': 'arm64-v8a',
                   'inputs.api': '28', 'inputs.validation': 'false', 'inputs.compiler_cache': 'true'}
         with tempfile.TemporaryDirectory() as directory:
@@ -267,6 +267,62 @@ class AndroidApkWorkflowTests(unittest.TestCase):
         ndk = re.search(r'ndk="\$\{WANTED_NDK:-(\S+)\}"', block).group(1)
         self.assertRegex(ndk, r'^2[7-9]\.\d+\.\d+$', ndk)
         self.assertIn(ndk, (ROOT / 'docs/android.md').read_text(encoding='utf-8'))
+
+    def test_the_sources_arrive_either_as_a_link_or_from_a_repository(self):
+        """One of the two ways in, each gated on its own input."""
+        self.assertIn("if: inputs.sources_url != ''", self.text)
+        self.assertIn("if: inputs.sources_repo != ''", self.text)
+        download = self.steps['Download the game code']
+        self.assertIn('scripts/fetch_sources.py', download)
+        # The link opens the zip to anyone who has it, and this repository's
+        # run logs can be read by anyone too: it is masked, never echoed.
+        self.assertIn('::add-mask::${{ inputs.sources_url }}', download)
+        self.assertNotIn('echo "${{ inputs.sources_url }}"', download)
+
+    @unittest.skipUnless(SHELL, 'the steps are shell scripts')
+    def test_the_workflow_says_when_no_game_code_was_given(self):
+        block = self.steps['Decide where the game code comes from']
+        cases = [
+            ({'inputs.sources_url': '', 'inputs.sources_repo': ''}, False),
+            ({'inputs.sources_url': 'https://drive.google.com/file/d/1ABC/view',
+              'inputs.sources_repo': ''}, True),
+            ({'inputs.sources_url': '', 'inputs.sources_repo': 'someone/sources'}, True),
+        ]
+        for values, accepted in cases:
+            with self.subTest(values=values), tempfile.TemporaryDirectory() as directory:
+                result = bash_step(block, directory, values)
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn('No game code', result.stdout)
+                    self.assertIn('sources_url', result.stdout)
+
+    @unittest.skipUnless(SHELL, 'the steps are shell scripts')
+    def test_the_download_step_hands_fetch_sources_the_link_and_the_digest(self):
+        block = self.steps['Download the game code']
+        link = 'https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUv/view?usp=sharing'
+        for digest in ('', 'a' * 64):
+            with self.subTest(sha256=bool(digest)), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / 'bin'
+                path.mkdir()
+                # fetch_sources.py is not run here: what it is given is.
+                (path / 'python').write_text(
+                    '#!/bin/sh\nprintf "%s\\n" "$*" > "$PWD/arguments.txt"\n')
+                (path / 'python').chmod(0o755)
+                (root / 'scripts').mkdir()
+                result = bash_step(block, directory,
+                                   {'inputs.sources_url': link, 'inputs.sources_sha256': digest},
+                                   dict(os.environ, PATH=str(path) + os.pathsep + os.environ['PATH'],
+                                        GITHUB_WORKSPACE=str(root)))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('::add-mask::' + link, result.stdout)
+                arguments = (root / 'arguments.txt').read_text().split()
+                self.assertEqual(arguments[:5],
+                                 ['scripts/fetch_sources.py', '--url', link,
+                                  '--output', str(root / 'sources')])
+                self.assertEqual(arguments[5:], ['--sha256', digest] if digest else [])
 
     @unittest.skipUnless(SHELL, 'the steps are shell scripts')
     def test_the_sdk_step_installs_what_the_scripts_read(self):

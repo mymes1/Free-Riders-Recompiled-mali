@@ -390,3 +390,32 @@ PATH 上的 `java`/`javac`/`keytool`/`python`/`cmake`/`ninja`/`unzip`/`git`，�
 真實安裝會留下的檔案）執行安裝步驟並檢查 SFR_ANDROID_NDK 與 ANDROID_HOME，另以 stub 的 `sudo`
 驗證 apt 只安裝缺少的套件（含 CMake 版本低於 3.20 時才補），步驟已改以名稱選取而非內容關鍵字；
 本容器另以 PyYAML 解析整份 workflow 並檢查每個 shell 區塊。
+
+## 遊戲程式碼改由連結提供：Drive 壓縮檔的下載與檢查
+
+Android 的 APK workflow 需要玩家自己產生的遊戲程式碼（`out/recomp/diagnostic`）與著色器包
+（`out/shaders/shaders.pack`），先前只能放進私有倉庫再讓 runner 以權杖讀取；現在也可以把兩者
+打包成一個 zip，用連結交給 runner。
+
+新增 `scripts/package_sources.py`：檢查兩者存在（含 pack 的 magic）後寫成
+`out/sources/sfr-sources.zip`，內含 `out/recomp/diagnostic/`… 與 `out/shaders/shaders.pack`
+（deflate，產生的 C++ 是文字，約可縮到五分之一），並印出 SHA-256。新增
+`scripts/fetch_sources.py`：接受 Google Drive 分享連結（`/file/d/<id>/view`、`open?id=`、
+`uc?export=download&id=` 都轉成 `drive.usercontent.google.com` 下載連結）、一般直接連結、或本機
+路徑；Drive 對較大的檔案會先回掃描確認頁，腳本擷取 `confirm` 權杖並帶 cookie 重試（以有限多個
+`y` 回答，避免 `yes` 在 GitHub 的 `bash -eo pipefail` 下留下 SIGPIPE 141）；下載後確認是 zip、
+比對 SHA-256（有提供時）、拒絕會寫到目錄以外的壓縮檔條目、解開後自行找到樹的根目錄，最後逐一
+檢查 `report.json`、`ppc_recomp.*.cpp`、`ppc_func_mapping.cpp`、`imports.cpp`、三個標頭與 pack
+的 magic 與著色器數量，缺少時直接列出路徑。
+
+workflow 因此改為兩條來源：`sources_url`（連結，含 `sources_sha256`）或 `sources_repo`（私有
+倉庫），各自以 `if:` 控制；兩者都空時第一步就停止並說明。連結在日誌中以 `::add-mask::` 遮蔽
+（公開倉庫的執行記錄任何人可讀，而連結等於取得產生的程式碼），`apk-info.txt` 只記錄使用哪一
+種來源。
+
+驗證：`tests/test_fetch_sources.py` 19 項，包含五種 Drive 連結形式、確認權杖的擷取與重試、
+以本機 HTTP 伺服器模擬掃描頁後送出 zip 的端到端測試（解開後檢查通過）、拒絕寫到目錄外的條目、
+pack 不是 shaders.pack 與缺少檔案時的訊息、`package_sources.py` 與 `fetch_sources.py` 的往返
+（含 SHA-256 不符時拒絕）；`tests/test_android_apk_workflow.py` 19 項，新增來源二選一、遮蔽
+連結、以及下載步驟交給 `fetch_sources.py` 的參數（有無 SHA-256）。全部 257 項 Python 測試中僅
+1 項因本容器沒有 `tools/XenosRecomp` 而失敗。

@@ -1,9 +1,11 @@
 # Builds an installable APK on a GitHub runner from game code that the player
-# generated on their own machine (scripts/prepare_recomp.py) and keeps in a
-# repository of their own -- private, by preference -- beside the shaders.pack
-# they collected. The disc image and everything extracted from it stay on the
-# machine that generated the code; CI here only ever reads the generated
-# sources that were pushed for it, and what it builds is a test APK for that
+# generated on their own machine (scripts/prepare_recomp.py) beside the
+# shaders.pack they collected (scripts/pack_shaders.py), zipped by
+# scripts/package_sources.py and handed over either as a link (a Google Drive
+# share link, downloaded by scripts/fetch_sources.py) or as a repository of
+# their own -- private, by preference. The disc image and everything extracted
+# from it stay on the machine that generated the code; CI here only ever reads
+# the generated sources it was given, and what it builds is a test APK for that
 # player's own device, not a release (docs/releasing.md).
 #
 # Setting up the sources repository, and putting the finished APK on a device:
@@ -13,9 +15,15 @@ name: android apk
 on:
   workflow_dispatch:
     inputs:
+      sources_url:
+        description: 'a link to the zip: a Google Drive share link, or any direct link'
+        default: ''
+      sources_sha256:
+        description: 'SHA-256 of that zip, so a download that stops early is caught'
+        default: ''
       sources_repo:
-        description: 'owner/repo holding the generated game code and shaders.pack'
-        required: true
+        description: 'owner/repo holding the same files (the other way to hand them over)'
+        default: ''
       sources_ref:
         description: 'branch, tag or commit there (empty: its default branch)'
         default: ''
@@ -62,15 +70,50 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 300
     steps:
-      - name: Check the sources repository
+      - name: Decide where the game code comes from
+        run: |
+          if [ -z '${{ inputs.sources_url }}' ] && [ -z '${{ inputs.sources_repo }}' ]; then
+            echo "::error::No game code: give either sources_url (a link to the zip" \
+                 "scripts/package_sources.py made) or sources_repo (a repository holding" \
+                 "out/recomp/diagnostic and shaders.pack). docs/android-apk-workflow.md."
+            exit 1
+          fi
+          if [ -n '${{ inputs.sources_url }}' ]; then
+            echo "The game code comes from the link in sources_url."
+          else
+            echo "The game code comes from ${{ inputs.sources_repo }}."
+          fi
+
+      - name: Check out the runtime
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Download the game code
+        if: inputs.sources_url != ''
+        run: |
+          # The link opens the zip to anyone who has it, and this repository's
+          # run logs are readable, so it is masked here and never printed.
+          echo "::add-mask::${{ inputs.sources_url }}"
+          # fetch_sources.py reads a Drive share link (including the page Drive
+          # answers with for a file it scanned), checks the zip's SHA-256 when
+          # one is given, unpacks it and then checks it holds what the build
+          # reads, so a broken upload costs a minute instead of an hour.
+          args=(--url '${{ inputs.sources_url }}' --output "$GITHUB_WORKSPACE/sources")
+          [ -z '${{ inputs.sources_sha256 }}' ] || args+=(--sha256 '${{ inputs.sources_sha256 }}')
+          python scripts/fetch_sources.py "${args[@]}"
+
+      - name: Check that the sources repository can be read
+        if: inputs.sources_repo != ''
         env:
           SOURCE_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
         run: |
           repo='${{ inputs.sources_repo }}'
           repo="${repo#https://github.com/}"; repo="${repo%.git}"
-          if [ "$repo" = '${{ github.repository }}' ]; then
-            echo "Reading the game code from this repository ($repo)."
-          elif [ -n "$SOURCE_TOKEN" ]; then
+          if [ -n "$SOURCE_TOKEN" ]; then
             echo "Reading the game code from $repo with the SOURCE_REPO_TOKEN secret."
           else
             # Without the secret the workflow's own token is used, which only
@@ -85,10 +128,8 @@ jobs:
             echo "Reading the game code from the public repository $repo."
           fi
 
-      - name: Check out the runtime
-        uses: actions/checkout@v5
-
       - name: Check out the game code
+        if: inputs.sources_repo != ''
         uses: actions/checkout@v5
         with:
           repository: ${{ inputs.sources_repo }}
@@ -98,7 +139,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Check the game code and the shader pack
+      - name: Check the game code that arrived
         run: |
           game="sources/${{ inputs.game_directory }}"
           pack="sources/${{ inputs.shaders_pack }}"
@@ -112,9 +153,10 @@ jobs:
             missing+=("$game/ppc_recomp.<number>.cpp (the generated functions)")
           [ -f "$pack" ] || missing+=("$pack")
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::error::The sources repository is missing:"
+            echo "::error::The game code that arrived is missing:"
             printf '  %s\n' "${missing[@]}"
-            echo "The layout it needs is in docs/android-apk-workflow.md."
+            echo "scripts/package_sources.py writes a zip with this layout; see"
+            echo "docs/android-apk-workflow.md."
             exit 1
           fi
           echo "generated functions: $count files"
@@ -127,11 +169,6 @@ jobs:
               sys.exit('not a shaders.pack: magic %r' % magic)
           print('shaders.pack: %d shaders' % struct.unpack('<I', shaders)[0])
           PY
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
 
       - name: Set up Java
         uses: actions/setup-java@v6
@@ -359,6 +396,9 @@ jobs:
           info=out/android/apk-info.txt
           {
             echo "commit=$(git rev-parse HEAD)"
+            # Which way the game code came, not the link itself: the link opens
+            # the zip to anyone who has it.
+            if [ -n '${{ inputs.sources_url }}' ]; then echo "sources=link"; else echo "sources=repository"; fi
             echo "sources_repo=${{ inputs.sources_repo }}"
             echo "sources_ref=${{ inputs.sources_ref }}"
             echo "game_directory=${{ inputs.game_directory }}"

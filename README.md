@@ -106,10 +106,13 @@ beside itself. Linux and Android builds, and what each step does, are in
 [docs/building.md](docs/building.md).
 
 The Android APK can also be built by a GitHub runner, from the code you
-generated and keep in a private repository of your own: the **android apk**
-workflow under **Actions** leaves an installable APK in its artifacts
-([docs/android-apk-workflow.md](docs/android-apk-workflow.md)). Your disc image
-never reaches CI, and neither does anything built from it.
+generated: `python scripts/package_sources.py` puts it and your `shaders.pack`
+in one zip, and the **android apk** workflow under **Actions** takes a link to
+that zip (or reads it from a private repository of yours) and leaves an
+installable APK in its artifacts
+([docs/android-apk-workflow.md](docs/android-apk-workflow.md) lists what has to
+be supplied). Your disc image never reaches CI, and neither does anything built
+from it.
 
 ## Controls
 
