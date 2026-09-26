@@ -59,6 +59,9 @@ Known limits:
   (`shaders.pack`, included in the releases). The game creates all of its
   468 shaders while it boots, so one run on Windows collects them all.
 - Android has been tried in the emulator and on one Adreno 750 handheld.
+  Mali devices (MediaTek/Samsung tablets among them) are the next target; a run
+  there now names the device it is on and, if it dies, why -- send `game.log`
+  ([docs/android-diagnostics.md](docs/android-diagnostics.md)).
 
 Progress notes (mostly in Traditional Chinese) are in [docs/](docs/), starting
 with [docs/progress.md](docs/progress.md).
@@ -69,7 +72,9 @@ with [docs/progress.md](docs/progress.md).
   (or Vulkan 1.2).
 - **Linux**: x86-64 with AVX and a Vulkan 1.2 driver (tested on Ubuntu 22.04).
 - **Android**: Android 9 or later, arm64-v8a, Vulkan 1.1; about 2 GB free
-  for the installed game.
+  for the installed game. Block compression (BC) is not required: a driver
+  without it (Mali drivers from MediaTek, among others) gets the title's
+  textures decoded on the CPU. 16 KiB-page devices are not supported yet.
 - Building needs the tools listed in [docs/building.md](docs/building.md).
 
 ## How to Install

@@ -7,6 +7,7 @@
 #include "imgui.h"
 #include <SDL.h>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <cerrno>
 #include <fcntl.h>
@@ -47,6 +49,38 @@ uint32_t exit_code_from_log(const fs::path& log) {
     const size_t stop = text.rfind("STOP ");
     if (stop == std::string::npos) return 1;
     return text.compare(stop, 18, "STOP window-closed") == 0 ? 0 : 3;
+}
+
+// The system's own account of why the game's process ended (GameExitReport.java).
+//
+// The runtime explains itself in game.log when it stops, and its own crash
+// reporter (src/crash_report.cpp) explains a death by signal. Nothing in a
+// process can explain the deaths the system deals out -- the low-memory killer
+// taking it, a driver aborting it, an ANR -- and game.log then simply stops,
+// mid-work, with no reason. Android writes those down, and the launcher's Java
+// side copies them to exit-report.txt as it comes back in front.
+//
+// Appended to game.log before the launcher reads its end, so the one file a
+// player sends carries the reason, and the stopped page shows it. The file is
+// consumed: the next run's stopped page must not show this one's death.
+void append_exit_report(const fs::path& log) {
+    std::error_code error;
+    const fs::path report = log.parent_path() / "exit-report.txt";
+    // The launcher writes it as it resumes, which races this read; the write
+    // is atomic (a rename), so waiting for it to appear is enough.
+    for (int attempt = 0; attempt < 25 && !fs::is_regular_file(report, error); ++attempt)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!fs::is_regular_file(report, error)) return;
+    std::ifstream in(report, std::ios::binary);
+    if (!in) return;
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    fs::remove(report, error);
+    if (text.empty()) return;
+    std::ofstream out(log, std::ios::binary | std::ios::app);
+    if (!out) return;
+    out << '\n' << text;
+    if (text.back() != '\n') out << '\n';
 }
 
 std::mutex picked_lock;
@@ -87,6 +121,7 @@ public:
         launcher_back = false;
         return exit_code_from_log(log_);
     }
+    void finished() override { append_exit_report(log_); }
 private:
     fs::path log_;
 };
@@ -350,6 +385,12 @@ std::unique_ptr<GameProcess> start_game(const LauncherSettings& settings, const 
         if (!env) return nullptr;
         env << "# Written by the launcher at each start.\n";
         for (const auto& [name, value] : game_environment(settings)) env << name << '=' << value << '\n';
+    }
+    // A report the launcher has not consumed yet (GameExitReport.java) belongs
+    // to a death that is over: it must not be appended to the next run's log.
+    {
+        std::error_code leftover;
+        fs::remove(log.parent_path() / "exit-report.txt", leftover);
     }
     game_launched = true;
     launcher_back = false;

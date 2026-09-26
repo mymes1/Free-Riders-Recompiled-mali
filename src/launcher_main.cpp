@@ -27,6 +27,7 @@
 #endif
 
 #include "imgui_internal.h"
+#include "crash_report.h"
 #include "installer.h"
 #include "launcher_art.h"
 #include "launcher_platform.h"
@@ -930,6 +931,9 @@ struct Launcher {
     // brings it back with the reason.
     bool game_ended() {
         exit_code = game->exit_code().value_or(0);
+        // The platform's own account of the death (Android: the system's exit
+        // reasons) goes into the log before its end is read for this page.
+        game->finished();
         game.reset();
         stopped_lines = log_tail(log_file, 14);
         bool closed = exit_code == 0;
@@ -1583,9 +1587,10 @@ struct Launcher {
         const float x = margin * scale + slide();
         ImGui::SetCursorPosX(x);
         ImGui::TextColored(dim_text, tr(StoppedDetail), exit_code);
-        // The runtime names why it stopped on a line of its own.
+        // The runtime names why it stopped on a line of its own, and the
+        // system names why it was taken when the runtime never got the chance.
         for (const auto& line : stopped_lines)
-            if (line.rfind("STOP ", 0) == 0) {
+            if (line.rfind("STOP ", 0) == 0 || line.rfind("EXIT ", 0) == 0) {
                 ImGui::SetCursorPosX(x);
                 ImGui::PushTextWrapPos(size.x - margin * scale);
                 ImGui::TextWrapped("%s", line.c_str());
@@ -1940,6 +1945,7 @@ struct Launcher {
 #ifdef _WIN32
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    sfr::install_crash_reporter("launcher");
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     Launcher launcher;
@@ -2084,6 +2090,10 @@ int main(int argc, char** argv) {
     SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");  // back is the launcher's own Back
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
 #endif
+    // The launcher is a process of its own on Android, and the one the player
+    // is left with when the game dies: it gets the same report a death by
+    // signal would otherwise lose (src/crash_report.cpp).
+    sfr::install_crash_reporter("launcher");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
         std::fprintf(stderr, "SDL is not available: %s\n", SDL_GetError());
         return 1;

@@ -66,6 +66,15 @@ public:
     WriteLease pin_writes(std::span<const Range> ranges);
     static constexpr uint64_t address_space_size = 0x100000000ull;
     static constexpr uint64_t default_backing_budget = 0x20000000ull;
+    // The budget a run starts with: SFR_GUEST_MEMORY_MB when the host or a
+    // player's settings ask for another one, clamped to a range that can work
+    // (64 MiB to 2048 MiB), else default_backing_budget. A phone or tablet
+    // kills a process that holds too much for its neighbours, and the title's
+    // committed memory is a fraction of what it asks the guest for
+    // (docs/physical-memory.md); a guest that runs out stops with a named
+    // reason instead of the process being taken. Resolved once, at startup,
+    // and named on a NATIVE_GUEST_MEMORY line when the environment set it.
+    static uint64_t backing_budget_from_environment();
     struct Usage { uint64_t reserved_bytes; uint64_t committed_bytes; };
     explicit GuestMemory(uint64_t backing_budget = default_backing_budget);
     ~GuestMemory();

@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <cstdlib>
 #include <utility>
@@ -152,6 +154,29 @@ bool virtual_alloc2_available() {
 RuntimeStop::RuntimeStop(std::string category, uint64_t address, std::string detail)
     : std::runtime_error(category + ": " + detail), category(std::move(category)),
       address(address), detail(std::move(detail)) {}
+
+uint64_t GuestMemory::backing_budget_from_environment() {
+    // Resolved once: the entry point, the memory itself and the crash report's
+    // environment line all ask, and the answer (and its one log line) is the
+    // same for the whole run.
+    static const uint64_t budget = [] {
+        const char* const text = std::getenv("SFR_GUEST_MEMORY_MB");
+        if (text && *text) {
+            char* end = nullptr;
+            const unsigned long long megabytes = std::strtoull(text, &end, 10);
+            // A rejected value is named rather than ignored: the log then says
+            // why the run's guest memory is not what its settings asked for.
+            if (end != text && !*end && megabytes >= 64 && megabytes <= 2048) {
+                std::fprintf(stderr, "NATIVE_GUEST_MEMORY source=environment megabytes=%llu\n", megabytes);
+                return uint64_t(megabytes) << 20;
+            }
+            std::fprintf(stderr, "NATIVE_GUEST_MEMORY source=environment value=\"%s\" rejected=1 default_mb=%llu\n",
+                         text, static_cast<unsigned long long>(default_backing_budget >> 20));
+        }
+        return uint64_t(default_backing_budget);
+    }();
+    return budget;
+}
 
 GuestMemory::GuestMemory(uint64_t backing_budget)
     : fast_pages_(std::make_unique<uint8_t[]>(address_space_size / fast_page_size)),

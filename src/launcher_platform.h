@@ -34,6 +34,12 @@ public:
     virtual ~GameProcess() = default;
     // Null while it runs.
     virtual std::optional<uint32_t> exit_code() = 0;
+    // Called once, after exit_code() first answered and before the launcher
+    // reads the end of game.log for its stopped page: the platform's chance to
+    // add what only it knows. Android appends the system's own account of why
+    // the game's process ended (GameExitReport.java), which is the only account
+    // there is when nothing in the process survived to write one.
+    virtual void finished() {}
 };
 std::unique_ptr<GameProcess> start_game(const LauncherSettings& settings, const std::filesystem::path& directory,
                                         const std::filesystem::path& log);

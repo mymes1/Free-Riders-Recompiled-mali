@@ -281,6 +281,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/imgui/imgui.cpp")
     set(SFR_IMGUI "${CMAKE_CURRENT_SOURCE_DIR}/tools/imgui")
     # The launcher lists the host's cameras for its camera setting.
     set(SFR_LAUNCHER_SOURCES src/launcher_main.cpp src/launcher_settings.cpp src/launcher_sound.cpp src/launcher_art.cpp src/sony_gamepad.cpp
+        src/crash_report.cpp
         ${SFR_CAMERA_CAPTURE}
         ${SFR_IMGUI}/imgui.cpp ${SFR_IMGUI}/imgui_draw.cpp ${SFR_IMGUI}/imgui_tables.cpp ${SFR_IMGUI}/imgui_widgets.cpp)
     if(WIN32)
@@ -295,16 +296,24 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/imgui/imgui.cpp")
             # liblauncher.so, run by LauncherActivity (android/).
             add_library(sfr_launcher SHARED ${SFR_LAUNCHER_SOURCES})
             set_target_properties(sfr_launcher PROPERTIES OUTPUT_NAME launcher)
-            target_link_libraries(sfr_launcher PRIVATE android log)
+            target_link_libraries(sfr_launcher PRIVATE android log ${CMAKE_DL_LIBS})
         else()
             add_executable(sfr_launcher ${SFR_LAUNCHER_SOURCES})
             set_target_properties(sfr_launcher PROPERTIES OUTPUT_NAME FreeRidersRecompiled)
         endif()
         target_compile_definitions(sfr_launcher PRIVATE SFR_UI_SOUND_SDL)
-        target_link_libraries(sfr_launcher PRIVATE sfr_installer SDL2::SDL2)
+        target_link_libraries(sfr_launcher PRIVATE sfr_installer SDL2::SDL2 ${CMAKE_DL_LIBS})
     endif()
     target_include_directories(sfr_launcher PRIVATE src ${SFR_IMGUI} ${SFR_IMGUI}/backends)
 endif()
+# The crash report a death by signal leaves in the log (src/crash_report.cpp):
+# the test crashes a child of its own.
+add_executable(sfr_crash_report_test tests/crash_report_test.cpp src/crash_report.cpp)
+target_include_directories(sfr_crash_report_test PRIVATE src)
+target_compile_definitions(sfr_crash_report_test PRIVATE SFR_CRASH_GUEST_STATE=1)
+target_link_libraries(sfr_crash_report_test PRIVATE ${CMAKE_DL_LIBS})
+add_test(NAME crash_report COMMAND sfr_crash_report_test)
+set_tests_properties(crash_report PROPERTIES TIMEOUT 30)
 add_executable(sfr_texture_fetch_test tests/texture_fetch_test.cpp src/texture_fetch.cpp)
 target_include_directories(sfr_texture_fetch_test PRIVATE src)
 add_test(NAME texture_fetch COMMAND sfr_texture_fetch_test)
@@ -600,6 +609,10 @@ if(SFR_BUILD_DIAGNOSTIC)
     else()
         add_executable(sfr_cpu_diagnostic)
     endif()
+    # A death by signal writes its own report, with the guest function the
+    # crashing thread was in (src/crash_report.cpp, docs/android-diagnostics.md).
+    target_sources(sfr_cpu_diagnostic PRIVATE src/crash_report.cpp)
+    target_compile_definitions(sfr_cpu_diagnostic PRIVATE SFR_CRASH_GUEST_STATE=1)
     target_sources(sfr_cpu_diagnostic PRIVATE src/diagnostic_main.cpp src/guest_memory.cpp src/xex_module.cpp src/virtual_memory.cpp src/critical_section.cpp src/hardware_info.cpp src/thread_local_storage.cpp src/system_time.cpp src/guest_clock.cpp src/timestamp_bundle.cpp src/vector_memory.cpp src/optional_import_policy.cpp src/native_modules.cpp src/integer_arithmetic.cpp src/memory_statistics.cpp
         ${SFR_DIAGNOSTIC_SOURCES} "${SFR_DIAGNOSTIC_DIR}/ppc_func_mapping.cpp" "${SFR_DIAGNOSTIC_DIR}/imports.cpp")
     target_include_directories(sfr_cpu_diagnostic PRIVATE src "${SFR_DIAGNOSTIC_DIR}" tools/XenonRecomp/thirdparty/simde tools/XenonRecomp/thirdparty/TinySHA1)
@@ -633,7 +646,8 @@ if(SFR_BUILD_DIAGNOSTIC)
     if(WIN32)
         target_link_libraries(sfr_cpu_diagnostic PRIVATE ws2_32 user32)
     else()
-        target_link_libraries(sfr_cpu_diagnostic PRIVATE SDL2::SDL2)
+        # dladdr and backtrace, for the crash report.
+        target_link_libraries(sfr_cpu_diagnostic PRIVATE SDL2::SDL2 ${CMAKE_DL_LIBS})
     endif()
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         message(FATAL_ERROR "The generated diagnostic currently requires Clang.")

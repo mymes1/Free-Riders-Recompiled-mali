@@ -28,10 +28,26 @@ import org.libsdl.app.SDLActivity;
 public class LauncherActivity extends SDLActivity {
     private static final int PICK_DOCUMENT = 1;
 
+    // When this launcher session began: the game cannot have ended before it,
+    // and the exit reasons the system keeps go back for days
+    // (GameExitReport).
+    private static long startedAt;
+
     @Override
     protected void onCreate(Bundle state) {
+        startedAt = System.currentTimeMillis();
         copyBundledShaderPack();
         super.onCreate(state);
+    }
+
+    // The launcher is in front again after the game: its process ended, and
+    // Android knows why (GameExitReport). Written before super.onResume() so
+    // the file is there by the time the native launcher reads the end of
+    // game.log for its stopped page.
+    @Override
+    protected void onResume() {
+        GameExitReport.capture(this, startedAt);
+        super.onResume();
     }
 
     // A release APK carries shaders.pack (scripts/package_android.py --pack).

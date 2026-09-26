@@ -1,4 +1,5 @@
 #include "diagnostic_hooks.h"
+#include "crash_report.h"
 #include "ppc_recomp_shared.h"
 #include "xex_module.h"
 #include "virtual_memory.h"
@@ -332,6 +333,17 @@ static thread_local GuestExecution::Lease* execution_permit = nullptr;
 static thread_local const PPCContext* current_context = nullptr;
 static thread_local uint32_t current_pcr = diagnostic_pcr, current_thread = diagnostic_thread, current_id = 1;
 static thread_local uint32_t current_tls = ThreadLocalStorage::static_address, current_tls_dynamic = 0;
+
+// The crash reporter's questions (src/crash_report.cpp), answered here because
+// the generated context is complete only in this file: which guest the
+// crashing thread is, the function it entered last and its address (the entry
+// path's own record, diagnostic_hooks.h), and where that function was called
+// from -- the LR the entry path cannot read, since it sees the context
+// incomplete. Nothing here runs per entry.
+uint32_t guest_identity() { return current_id; }
+uint32_t guest_return_address() { return current_context ? static_cast<uint32_t>(current_context->lr) : 0; }
+const char* guest_function() { return guest_entry.current_function; }
+uint32_t guest_address() { return guest_entry.current_address; }
 
 // What each guest thread is doing when nothing moves any more. A hang leaves
 // every thread in a wait, so nothing reaches a checkpoint and the stack dump
@@ -3358,10 +3370,17 @@ void call_indirect(PPCContext& ctx, uint8_t* base, uint32_t address) {
 }
 
 int main(int argc, char** argv) {
+    // A death by signal explains itself from here on (src/crash_report.cpp),
+    // with the guest function the crashing thread was in; what a killed
+    // process cannot explain, the launcher's exit reasons add
+    // (GameExitReport.java). Installed before anything else runs, and once:
+    // the Android entry installed it before this function was reached.
+    sfr::install_crash_reporter("game", sfr::GuestMemory::backing_budget_from_environment());
     // The trace is written through std::cerr, which is unbuffered: one write
     // per insertion dominated the run time. Buffer it (1 MiB); normal exits
     // and every reported stop flush it. Guest threads still write in order
-    // because only the permit owner runs guest code.
+    // because only the permit owner runs guest code. The crash report flushes
+    // it before writing, so the report stays the last thing in the log.
     static char trace_buffer[1 << 20];
     std::setvbuf(stderr, trace_buffer, _IOFBF, sizeof trace_buffer);
     std::cerr.unsetf(std::ios::unitbuf);
@@ -3414,7 +3433,9 @@ int main(int argc, char** argv) {
             throw std::runtime_error("decoded image size differs from compiled game");
         sfr::GuestClock clock;
         sfr::active_clock = &clock;
-        sfr::GuestMemory memory;
+        // The budget this run gets: less than the default when a device's
+        // settings ask for less (SFR_GUEST_MEMORY_MB, launcher_settings.cpp).
+        sfr::GuestMemory memory(sfr::GuestMemory::backing_budget_from_environment());
         sfr::VirtualMemory allocations(memory);
         sfr::virtual_memory = &allocations;
         sfr::active_memory = &memory;

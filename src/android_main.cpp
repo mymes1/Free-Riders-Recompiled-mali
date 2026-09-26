@@ -7,6 +7,8 @@
 //   settings.env              optional NAME=VALUE lines for the runtime (read by
 //                             GameActivity before the libraries load)
 //   game.log                  the runtime's trace output (rewritten each start)
+#include "crash_report.h"
+#include "guest_memory.h"
 #include <SDL.h>
 #include <android/log.h>
 #include <unistd.h>
@@ -27,6 +29,10 @@ extern "C" int SDL_main(int, char**) {
     if (!std::freopen("game.log", "w", stderr))
         __android_log_print(ANDROID_LOG_WARN, "FreeRiders", "cannot write %s/game.log", root);
     std::setvbuf(stderr, nullptr, _IOLBF, 1 << 16);  // whole lines, so a crash keeps the trace
+    // The log now has a destination: say what the machine is, and give a death
+    // by signal a report of its own (src/crash_report.cpp). The budget is the
+    // one the runtime will use, so the line says what the run asked for.
+    sfr::install_crash_reporter("game", sfr::GuestMemory::backing_budget_from_environment());
     // GameActivity.loadLibraries has put settings.env and the defaults in the
     // environment already: the runtime reads them while libmain.so loads.
     const char* region = std::getenv("SFR_GAME_REGION");

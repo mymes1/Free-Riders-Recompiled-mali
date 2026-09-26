@@ -300,3 +300,38 @@ Runtime與準備工具均經獨立規格及品質審查；原始AddRef也經獨�
 驗證：`out/sthu-final-build.log`、`out/sthu-final-ctest.log`（26/26）、
 `out/sthu-final-tests.log`（127項Python，無略過）、`out/sthu-final-dependencies.log`。
 Runtime與產生器皆經獨立規格／語意及品質審查。詳見 [sthu與真實效果初始化](store-halfword-update.md)。
+
+
+## 裝置上的崩潰有了紀錄：裝置資訊、訊號報告與系統終止原因
+
+Android 版一直有個盲點：執行中的訊息在 game.log，但行程若因訊號死亡就什麼都不會留下，記錄
+就停在工作進行到一半的地方；啟動器只顯示記錄最後幾行，真正的原因只在沒人讀的 logcat 緩衝
+區裡。Mali 裝置（例如 Galaxy Tab A9 Wi-Fi，SM-X110，Android 15）送回的啟動崩潰記錄正停在
+一次 `MmAllocatePhysicalMemoryEx` 之後，沒有 `STOP`，就屬於這一類：無法分辨是原生訊號崩潰、
+系統低記憶體回收，還是顯示驅動中止了行程。
+
+新增 `src/crash_report.cpp`（`install_crash_reporter`）處理 `SIGSEGV`／`SIGBUS`／`SIGILL`／
+`SIGFPE`／`SIGABRT`／`SIGSYS`／`SIGTRAP`：先把執行時緩衝的訊息沖出（報告因此位於記錄最後），
+再以非同步訊號安全的方式寫出 `CRASH` 報告——訊號、錯誤碼、位址與種類、客體執行到的最後一個
+函式與呼叫來源（`guest_id`／`function`／`entry`／`lr`，與 `LAST_FUNCTION` 同一組來源，進入路徑
+不因此多付成本）、`backtrace` 每一格的模組、載入基底與位移，最後再寫一次原因行（啟動器的停止
+頁面顯示的是最後幾行）。行程仍以同一個訊號結束，tombstone、結束碼與啟動器的判斷都不變；
+Windows 只寫裝置資訊行。同時新增 `NATIVE_DEVICE` 行（ABI、API、機型、頁面大小、記憶體、CPU 與
+客體預算）、頁面大小非 4096 的 `NATIVE_PAGE_SIZE_NOTE`，以及 `SFR_GUEST_MEMORY_MB`
+（64–2048 MB，客體在預算用完時以具名理由停止，而不是被系統回收）。
+
+行程無法說明的那一半交給系統：`GameExitReport.java` 在啟動器回到前景時讀取 Android 11 以上的
+行程結束原因（`LOW_MEMORY`、`CRASH_NATIVE`、`SIGNALED`、`ANR`，含原生崩潰的 tombstone 文字與
+最後的 rss／pss），寫成 `exit-report.txt`，由啟動器在讀取記錄結尾前附加進 game.log，停止頁面
+也把 `EXIT` 行與 `STOP` 行一起凸顯。文件見 [Android 診斷](android-diagnostics.md)。
+
+驗證：`tests/crash_report_test.cpp`（自行 fork、`raise(SIGSEGV)`，檢查裝置資訊行只寫一次、客體行、
+堆疊、結尾原因行，以及緩衝訊息先於報告寫出）以
+`g++ -std=c++20 -Wall -Wextra -g -DSFR_CRASH_GUEST_STATE=1 -Isrc tests/crash_report_test.cpp src/crash_report.cpp -o /tmp/crash_test -ldl`
+建置後全數通過；Python 測試 219 項中僅 1 項因本容器沒有 `tools/XenosRecomp`（未取得相依）而
+失敗，其餘通過、11 項略過。本容器沒有 cmake、NDK 與 Android SDK（也沒有產生的 recomp 原始碼），
+因此其餘新增或修改的 C++（`diagnostic_main.cpp`、`android_main.cpp`、`launcher_*.cpp`、
+`guest_memory.*`）與 Java 只能由正常工具鏈建置驗證；`crash_report.cpp`、`guest_memory.cpp` 已在
+本容器以 g++ 個別檢查。
+裝置上的實際崩潰仍未定位：下一次用新版本執行時，`game.log` 會直接說明是訊號、系統終止或
+驅動中止，並指出客體當時所在的函式。
