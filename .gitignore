@@ -24,3 +24,5 @@ __pycache__/
 /game/
 /settings.ini
 *.log
+# The generated game code the android apk workflow checks out (docs/android-apk-workflow.md)
+/sources/

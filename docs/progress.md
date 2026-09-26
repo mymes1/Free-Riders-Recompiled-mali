@@ -335,3 +335,43 @@ Windows 只寫裝置資訊行。同時新增 `NATIVE_DEVICE` 行（ABI、API、�
 本容器以 g++ 個別檢查。
 裝置上的實際崩潰仍未定位：下一次用新版本執行時，`game.log` 會直接說明是訊號、系統終止或
 驅動中止，並指出客體當時所在的函式。
+
+## APK 改由 GitHub Actions 建置
+
+Android 版過去只能在裝有 NDK 的機器上打包，而追查裝置上的啟動崩潰需要反覆產生 APK。新增
+`.github/workflows/android-apk.yml`（Actions → **android apk** → Run workflow）：在 GitHub 的
+runner 上以映像內建的 NDK、SDK 與 JDK 建置 `arm64-v8a`（或 `x86_64`、兩者），把
+`out/android/FreeRidersRecompiled.apk` 連同 `apk-info.txt` 留在該次執行的 artifacts 裡，不建立
+發行版。
+
+遊戲程式碼不由 CI 產生，也不會經過 CI：使用者先在自己的機器上跑 `scripts/prepare_recomp.py`
+與 `scripts/pack_shaders.py`，把 `out/recomp/diagnostic` 與 `out/shaders/shaders.pack` 依相同路徑
+推到自己建立的私有倉庫，再以細粒度權杖（`SOURCE_REPO_TOKEN`，僅該倉庫的 Contents: Read）
+讓 workflow 讀取；光碟映像檔與 `private/`、`game/` 永遠留在本機。這與
+[發行](releasing.md)的政策一致：這是給自己裝置的測試 APK，不是發行版。
+
+建置前先檢查產生的程式碼（`report.json`、`ppc_recomp_shared.h`、`ppc_context.h`、
+`ppc_config.h`、`ppc_func_mapping.cpp`、`imports.cpp`、`ppc_recomp.*.cpp`）與 `shaders.pack`
+的 magic 與著色器數量，缺少時直接指出路徑，而不是等到建置中途才失敗。`tools/` 以相依鎖檔為
+鍵快取，編譯物件以 ccache 快取（`build_android.sh` 新增 `--cmake-argument`，用來傳入
+`CMAKE_*_COMPILER_LAUNCHER`），並在開始前移除 runner 上多餘的 NDK 與模擬器以空出空間。
+建置後讀取 APK 的 badging、簽章指紋、內容與 SHA-256 寫進該次執行的摘要，並確認每個 ABI 都有
+`libmain.so`、`liblauncher.so`、`libSDL2.so`、`libc++_shared.so`、`classes.dex` 與
+`assets/shaders.pack`。
+
+`scripts/package_android.py` 因此可以指定簽章金鑰（`--keystore` 或 `SFR_ANDROID_KEYSTORE`，
+含密碼與別名）及版本名稱／代碼，並在簽署後印出簽章者：只有同一個金鑰簽署的 APK 能就地更新
+裝置上的版本，因此保留已安裝的遊戲與存檔。workflow 從 secrets 取得金鑰，未設定時由 runner
+產生新的 debug 金鑰，此時得先解除安裝（文件說明如何先以 adb 備份 `files/` 目錄）。
+
+驗證：`tests/test_android_apk_workflow.py` 檢查 workflow 只用 `build_android.sh` 真正解析的
+選項、`SFR_ANDROID_*` 變數都存在於腳本中、用到的 secrets 與輸入都寫在
+[android-apk-workflow.md](android-apk-workflow.md)，且每一步的 shell 都能通過 `bash -n`；
+本容器另以 PyYAML 解析整份 workflow、確認每個 action 的版本標籤存在於上游倉庫。
+runner 上的實際建置與裝置安裝尚未驗證（本容器沒有 NDK、Android SDK 與裝置，也還沒有
+私有來源倉庫）。
+
+GitHub 拒絕讓應用程式推送 `.github/workflows/`（權杖沒有 workflows 權限），因此同一份檔案另外
+保留在 `packaging/android-apk.workflow.yml`，由使用者自己放進 `.github/workflows/android-apk.yml`
+（或在網頁介面新增）；[android-apk-workflow.md](android-apk-workflow.md) 的步驟 0 就是這件事。
+測試讀取存在於兩者之一的檔案，兩份都存在時則要求內容一致。

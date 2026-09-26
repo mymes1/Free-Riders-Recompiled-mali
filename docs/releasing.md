@@ -7,6 +7,13 @@ the disc's files (`default.xex`, the asset archives, `image.bin`), saves, or
 anything from `private/` or `game/`. GitHub Actions cannot make a release: it
 has no disc, and must never be given one.
 
+One workflow does build an APK: `.github/workflows/android-apk.yml` packages the
+game on a runner from generated code the player pushed to a private repository
+of their own ([android-apk-workflow.md](android-apk-workflow.md)). It is a test
+build for one device, under the runner's debug key, left in the run's
+artifacts; the runner still never sees a disc, and publishing below is
+unchanged.
+
 What a release does contain, beside the launcher: the recompiled game
 (`sfr_cpu_diagnostic`), the `shaders.pack` translated so far, the licences
 and, on Windows, the shader tools that translate shaders the pack lacks.
@@ -33,6 +40,10 @@ Linux (WSL is fine), then Android:
 scripts/build_linux.sh --diagnostic out/recomp/diagnostic
 scripts/build_android.sh --diagnostic out/recomp/diagnostic --abi arm64-v8a --pack out/shaders/shaders.pack
 ```
+
+(The Android one can also be run by `.github/workflows/android-apk.yml` from the
+generated code in a private repository, which is how a test APK is built on a
+machine without the NDK.)
 
 The APK is signed with the local debug key (`~/.android/debug.keystore`).
 Keep that key: Android only installs an update signed with the same one.

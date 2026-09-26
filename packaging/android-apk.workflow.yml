@@ -1,0 +1,305 @@
+# Builds an installable APK on a GitHub runner from game code that the player
+# generated on their own machine (scripts/prepare_recomp.py) and keeps in a
+# repository of their own -- private, by preference -- beside the shaders.pack
+# they collected. The disc image and everything extracted from it stay on the
+# machine that generated the code; CI here only ever reads the generated
+# sources that were pushed for it, and what it builds is a test APK for that
+# player's own device, not a release (docs/releasing.md).
+#
+# Setting up the sources repository, and putting the finished APK on a device:
+# docs/android-apk-workflow.md.
+name: android apk
+
+on:
+  workflow_dispatch:
+    inputs:
+      sources_repo:
+        description: 'owner/repo holding the generated game code and shaders.pack'
+        required: true
+      sources_ref:
+        description: 'branch, tag or commit there (empty: its default branch)'
+        default: ''
+      game_directory:
+        description: 'generated game code inside that repository'
+        default: 'out/recomp/diagnostic'
+      shaders_pack:
+        description: 'shaders.pack inside that repository'
+        default: 'out/shaders/shaders.pack'
+      abi:
+        description: 'device ABI (x86_64 is for the emulator)'
+        type: choice
+        options:
+          - arm64-v8a
+          - x86_64
+          - both
+        default: arm64-v8a
+      api:
+        description: 'minimum Android API level (28 or newer)'
+        default: '28'
+      ndk:
+        description: 'NDK version to use (empty: the newest the runner has)'
+        default: ''
+      validation:
+        description: 'build with the Vulkan validation layers'
+        type: boolean
+        default: false
+      compiler_cache:
+        description: 'reuse compiled objects between runs (ccache)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # A build takes tens of minutes, and the runs share a compiler cache.
+  group: android-apk-${{ github.ref }}-${{ inputs.abi }}
+  cancel-in-progress: false
+
+jobs:
+  apk:
+    name: ${{ inputs.abi }} APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - name: Check the sources repository
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+        run: |
+          repo='${{ inputs.sources_repo }}'
+          repo="${repo#https://github.com/}"; repo="${repo%.git}"
+          if [ "$repo" = '${{ github.repository }}' ]; then
+            echo "Reading the game code from this repository ($repo)."
+          elif [ -n "$SOURCE_TOKEN" ]; then
+            echo "Reading the game code from $repo with the SOURCE_REPO_TOKEN secret."
+          else
+            # Without the secret the workflow's own token is used, which only
+            # works for a repository that anyone can read.
+            status="$(curl -s -o /dev/null -w '%{http_code}' "https://api.github.com/repos/$repo")"
+            if [ "$status" != 200 ]; then
+              echo "::error::Cannot read $repo (HTTP $status) with this workflow's own token."
+              echo "Add a fine-grained token with read access to that repository (Contents: read) as"
+              echo "the SOURCE_REPO_TOKEN secret, then run this again: docs/android-apk-workflow.md."
+              exit 1
+            fi
+            echo "Reading the game code from the public repository $repo."
+          fi
+
+      - name: Check out the runtime
+        uses: actions/checkout@v5
+
+      - name: Check out the game code
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.sources_repo }}
+          ref: ${{ inputs.sources_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN || github.token }}
+          path: sources
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check the game code and the shader pack
+        run: |
+          game="sources/${{ inputs.game_directory }}"
+          pack="sources/${{ inputs.shaders_pack }}"
+          missing=()
+          for file in report.json ppc_recomp_shared.h ppc_context.h ppc_config.h \
+                      ppc_func_mapping.cpp imports.cpp; do
+            [ -f "$game/$file" ] || missing+=("$game/$file")
+          done
+          count="$(find "$game" -maxdepth 1 -name 'ppc_recomp.*.cpp' | wc -l | tr -d ' ')"
+          [ "$count" -gt 0 ] ||
+            missing+=("$game/ppc_recomp.<number>.cpp (the generated functions)")
+          [ -f "$pack" ] || missing+=("$pack")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::The sources repository is missing:"
+            printf '  %s\n' "${missing[@]}"
+            echo "The layout it needs is in docs/android-apk-workflow.md."
+            exit 1
+          fi
+          echo "generated functions: $count files"
+          du -sh "$game" "$pack"
+          python3 - "$pack" <<'PY'
+          import struct, sys
+          with open(sys.argv[1], 'rb') as pack:
+              magic, shaders = pack.read(8), pack.read(4)
+          if magic != b'SFRSHPK1':
+              sys.exit('not a shaders.pack: magic %r' % magic)
+          print('shaders.pack: %d shaders' % struct.unpack('<I', shaders)[0])
+          PY
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Choose the NDK
+        env:
+          WANTED: ${{ inputs.ndk }}
+        run: |
+          [ -n "$WANTED" ] || exit 0
+          # The image ships one NDK per release; ask the SDK manager for another
+          # only when the requested version is not already there.
+          if [ ! -d "$ANDROID_HOME/ndk/$WANTED" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$WANTED"
+          fi
+          echo "SFR_ANDROID_NDK=$ANDROID_HOME/ndk/$WANTED" >> "$GITHUB_ENV"
+
+      - name: Make room and install the build tools
+        run: |
+          # The image carries several NDKs (GBs each) and host toolchains the
+          # build does not use; the generated game code and its objects need
+          # the room, and only one NDK is used.
+          if [ -n "${SFR_ANDROID_NDK:-}" ]; then
+            keep="$(readlink -f "$SFR_ANDROID_NDK")"
+          else
+            keep="$(readlink -f "${ANDROID_NDK_LATEST_HOME:?the runner image sets ANDROID_NDK_LATEST_HOME}")"
+          fi
+          for ndk in "$ANDROID_HOME"/ndk/*; do
+            [ "$(readlink -f "$ndk")" = "$keep" ] || sudo rm -rf "$ndk"
+          done
+          sudo rm -rf "$ANDROID_HOME/emulator" /usr/share/dotnet
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+          revision="$(sed -n 's/^Pkg.Revision *= *//p' "$keep/source.properties")"
+          echo "NDK $revision at $keep"
+          case "$revision" in
+            2[7-9].*|[3-9][0-9].*) ;;
+            *) echo "::warning::NDK $revision is older than the 27 this project needs;" \
+                    "set the ndk input to a newer version.";;
+          esac
+          df -h /
+
+      - name: Cache the pinned dependencies
+        uses: actions/cache@v5
+        with:
+          path: tools
+          key: tools-${{ hashFiles('config/dependencies.lock.json') }}
+
+      - name: Fetch the pinned dependencies
+        run: python scripts/bootstrap.py
+
+      - name: Cache the compiled objects
+        if: inputs.compiler_cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ inputs.abi }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ inputs.abi }}-
+
+      - name: Prepare the signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          signing="$RUNNER_TEMP/signing.env"
+          : > "$signing"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            # The key that signed the APK already on the device, so that this
+            # build replaces it in place (Android checks the signature).
+            mkdir -p "$RUNNER_TEMP/keystore"
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore/debug.keystore"
+            printf 'export SFR_ANDROID_KEYSTORE=%q\n' "$RUNNER_TEMP/keystore/debug.keystore" >> "$signing"
+            [ -z "$STORE_PASSWORD" ] ||
+              printf 'export SFR_ANDROID_KEYSTORE_PASSWORD=%q\n' "$STORE_PASSWORD" >> "$signing"
+            [ -z "$KEY_ALIAS" ] ||
+              printf 'export SFR_ANDROID_KEY_ALIAS=%q\n' "$KEY_ALIAS" >> "$signing"
+            [ -z "$KEY_PASSWORD" ] ||
+              printf 'export SFR_ANDROID_KEY_PASSWORD=%q\n' "$KEY_PASSWORD" >> "$signing"
+            echo "Signing with the key in the ANDROID_KEYSTORE_BASE64 secret." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No ANDROID_KEYSTORE_BASE64 secret, so this build makes a fresh debug key:" >> "$GITHUB_STEP_SUMMARY"
+            echo "an app already installed from a locally built APK has to be removed first." >> "$GITHUB_STEP_SUMMARY"
+            echo "docs/android-apk-workflow.md shows how to keep the installed game." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Build the APK
+        env:
+          SFR_ANDROID_API: ${{ inputs.api }}
+          CCACHE_DIR: ${{ runner.temp }}/ccache
+          CCACHE_MAXSIZE: 4G
+          CCACHE_COMPRESS: 'true'
+        run: |
+          [ ! -s "$RUNNER_TEMP/signing.env" ] || . "$RUNNER_TEMP/signing.env"
+          # A version name that says which run this is, in the app's own info page.
+          export SFR_ANDROID_VERSION_NAME="$(
+            python -c 'import sys; sys.path.insert(0, "scripts"); import package_android as p; print(p.VERSION_NAME)'
+          )+ci.${{ github.run_number }}.$(git rev-parse --short=7 HEAD)"
+          args=(--diagnostic "$GITHUB_WORKSPACE/sources/${{ inputs.game_directory }}"
+                --pack "$GITHUB_WORKSPACE/sources/${{ inputs.shaders_pack }}")
+          if [ '${{ inputs.abi }}' != both ]; then
+            args+=(--abi '${{ inputs.abi }}')
+          fi
+          if [ '${{ inputs.validation }}' = true ]; then
+            args+=(--validation)
+          fi
+          if [ '${{ inputs.compiler_cache }}' = true ]; then
+            args+=(--cmake-argument -DCMAKE_C_COMPILER_LAUNCHER=ccache
+                   --cmake-argument -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+          fi
+          scripts/build_android.sh "${args[@]}"
+
+      - name: Check the APK
+        run: |
+          apk=out/android/FreeRidersRecompiled.apk
+          build_tools="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          listing="$(unzip -l "$apk")"
+          info=out/android/apk-info.txt
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "sources_repo=${{ inputs.sources_repo }}"
+            echo "sources_ref=${{ inputs.sources_ref }}"
+            echo "game_directory=${{ inputs.game_directory }}"
+            echo "shaders_pack=${{ inputs.shaders_pack }}"
+            echo "abi=${{ inputs.abi }}"
+            echo "api=${{ inputs.api }}"
+            echo "validation=${{ inputs.validation }}"
+            echo "compiler_cache=${{ inputs.compiler_cache }}"
+            echo "size=$(stat -c%s "$apk")"
+            echo "sha256=$(sha256sum "$apk" | cut -d' ' -f1)"
+          } > "$info"
+          for abi in arm64-v8a x86_64; do
+            grep -q "lib/$abi/libmain.so" <<< "$listing" || continue
+            for library in libmain.so liblauncher.so libSDL2.so libc++_shared.so; do
+              grep -q "lib/$abi/$library" <<< "$listing" ||
+                { echo "::error::$apk has no lib/$abi/$library"; exit 1; }
+            done
+          done
+          grep -q "classes.dex" <<< "$listing" ||
+            { echo "::error::$apk has no classes.dex"; exit 1; }
+          grep -q "assets/shaders.pack" <<< "$listing" ||
+            { echo "::error::$apk carries no assets/shaders.pack: the runner needs it for the launcher to copy out"; exit 1; }
+          {
+            echo "### ${{ inputs.abi }} APK"
+            echo '```'
+            cat "$info"
+            echo
+            "$build_tools/aapt2" dump badging "$apk" |
+              grep -E '^(package|sdkVersion|targetSdkVersion|native-code|uses-feature|application-label)' || true
+            echo
+            "$build_tools/apksigner" verify --print-certs "$apk" | grep -E '^Signer|digest' || true
+            echo
+            printf '%s\n' "$listing" | grep -E 'classes.dex|assets/|lib/'
+            echo '```'
+            echo "Download the APK below and install it with \`adb install -r\`; a pack the launcher"
+            echo "finds in the APK replaces an older bundled one when the app is updated."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: FreeRidersRecompiled-${{ inputs.abi }}-r${{ github.run_number }}
+          path: |
+            out/android/FreeRidersRecompiled.apk
+            out/android/apk-info.txt
+          if-no-files-found: error
+          retention-days: 30

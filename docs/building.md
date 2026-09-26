@@ -106,6 +106,11 @@ downloads). Install it, copy your disc image and a `shaders.pack` to the phone,
 then install from the app's launcher. Hold Back to leave the game. Details and
 limits: [android.md](android.md).
 
+A machine without the NDK can still build the APK: the **android apk** workflow
+does it on a GitHub runner from the game code you generated and pushed to a
+private repository of your own ([android-apk-workflow.md](android-apk-workflow.md)).
+The NDK and Java are the runner's, and your disc image is never involved.
+
 ## Tests
 
 ```bash

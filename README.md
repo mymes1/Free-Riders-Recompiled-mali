@@ -105,6 +105,12 @@ The launcher asks for your disc image on first run and installs the game
 beside itself. Linux and Android builds, and what each step does, are in
 [docs/building.md](docs/building.md).
 
+The Android APK can also be built by a GitHub runner, from the code you
+generated and keep in a private repository of your own: the **android apk**
+workflow under **Actions** leaves an installable APK in its artifacts
+([docs/android-apk-workflow.md](docs/android-apk-workflow.md)). Your disc image
+never reaches CI, and neither does anything built from it.
+
 ## Controls
 
 | Action | Keyboard | Controller |
