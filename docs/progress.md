@@ -375,3 +375,18 @@ GitHub 拒絕讓應用程式推送 `.github/workflows/`（權杖沒有 workflows
 保留在 `packaging/android-apk.workflow.yml`，由使用者自己放進 `.github/workflows/android-apk.yml`
 （或在網頁介面新增）；[android-apk-workflow.md](android-apk-workflow.md) 的步驟 0 就是這件事。
 測試讀取存在於兩者之一的檔案，兩份都存在時則要求內容一致。
+
+workflow 也改為自行安裝全部相依：先以 `android-actions/setup-android` 取得 SDK 命令列工具（映像
+本身沒有也能跑）、接受授權，再由 `sdkmanager` 安裝缺的 `platforms;android-35`、
+`build-tools;35.0.0` 與 `ndk`（預設固定 `29.0.13599879`，可用 `ndk` 輸入指定），CMake 不足 3.20、
+Ninja、ccache、unzip 則由 apt 補上；每一步安裝完都逐一檢查 `android.jar`、`aapt2`、`d8`、
+`zipalign`、`apksigner`、NDK 的 toolchain 檔、`llvm-strip`、兩個 triple 的 `libc++_shared.so` 與
+PATH 上的 `java`/`javac`/`keytool`/`python`/`cmake`/`ninja`/`unzip`/`git`，缺少時直接列出路徑。
+授權提示改用有限個 `y`（`yes` 會在 GitHub 的 `bash -eo pipefail` 下留下 SIGPIPE 141，讓安裝成功
+的步驟仍然失敗）；安裝的結果由後續檢查決定，不依賴 `sdkmanager` 的結束碼。騰出空間的步驟改在
+選定 NDK 之後，只保留使用的那一個。
+
+驗證：`tests/test_android_apk_workflow.py` 16 項，新增以 stub 的 `sdkmanager`（記錄要求、產生
+真實安裝會留下的檔案）執行安裝步驟並檢查 SFR_ANDROID_NDK 與 ANDROID_HOME，另以 stub 的 `sudo`
+驗證 apt 只安裝缺少的套件（含 CMake 版本低於 3.20 時才補），步驟已改以名稱選取而非內容關鍵字；
+本容器另以 PyYAML 解析整份 workflow 並檢查每個 shell 區塊。

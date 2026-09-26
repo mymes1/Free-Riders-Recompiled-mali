@@ -21,6 +21,13 @@ What the runner needs from you:
 | a token | `SOURCE_REPO_TOKEN`, able to read that repository |
 | a key (optional) | the keystore secrets below, so the APK replaces an installed one |
 
+Everything else the runner installs for itself: the Android SDK and its command
+line tools, platform 35 and build-tools 35.0.0 (aapt2, d8, zipalign,
+apksigner), the NDK — `29.0.13599879` unless the `ndk` input names another —
+plus CMake, Ninja, ccache and unzip, and Python and the JDK. Nothing has to be
+installed on the runner image, and after installing the step checks each of
+these and lists by name whatever it could not find.
+
 ## 0. Put the workflow in `.github/workflows/`
 
 Nothing shows under **Actions** until the file is on the repository's default
@@ -128,9 +135,13 @@ repository's default branch (merge this branch first). Then:
 | `shaders_pack` | where the pack is there (`out/shaders/shaders.pack`) |
 | `abi` | `arm64-v8a` for a tablet, `x86_64` for the emulator, `both` for both |
 | `api` | minimum Android version: 28, or 29 and up |
-| `ndk` | the NDK version to use (empty: the newest the runner has, or e.g. `29.0.13599879`) |
+| `ndk` | the NDK version to install (empty: the pinned `29.0.13599879`, the one [android.md](android.md) was verified with) |
 | `validation` | build with the Vulkan validation layers, for a debugging run |
 | `compiler_cache` | reuse compiled objects between runs; leave it on, the second run of the same code rebuilds only what changed |
+
+The **Install the SDK components and the NDK** step's log lines say which NDK,
+platform and build-tools it ended up with, and the **Install CMake, Ninja and
+ccache** step's say which of those it had to install.
 
 A build takes tens of minutes (the game is thirty thousand generated
 functions). When it finishes, the run's summary lists what was built - commit,

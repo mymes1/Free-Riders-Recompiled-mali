@@ -32,12 +32,20 @@ BUILD_SCRIPT = ROOT / 'scripts/build_android.sh'
 PACKAGING = ROOT / 'scripts/package_android.py'
 
 
-def run_blocks(text):
-    """Every `run: |` body of the workflow, dedented, in order."""
+def run_steps(text):
+    """Every `run: |` body of the workflow, dedented, keyed by its step's name.
+
+    Blocks are picked by what a step is called rather than by a word that
+    happens to be in it: several steps talk about the same tools.
+    """
     lines = text.splitlines()
-    blocks = []
+    steps = {}
+    name = 'the step before any name'
     index = 0
     while index < len(lines):
+        named = re.match(r'^\s*- name: (.+)$', lines[index])
+        if named is not None:
+            name = named.group(1).strip()
         match = re.match(r'^(\s*)run: \|$', lines[index])
         if match is None:
             index += 1
@@ -52,8 +60,8 @@ def run_blocks(text):
             body.append(line)
             index += 1
         margin = min(len(line) - len(line.lstrip()) for line in body if line.strip())
-        blocks.append('\n'.join(line[margin:] for line in body))
-    return blocks
+        steps[name] = '\n'.join(line[margin:] for line in body)
+    return steps
 
 
 SHELL = shutil.which('bash') if os.name != 'nt' else None
@@ -71,7 +79,8 @@ def bash_step(block, directory, values, environment=None):
 class AndroidApkWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.text = WORKFLOW.read_text(encoding='utf-8')
-        self.blocks = run_blocks(self.text)
+        self.steps = run_steps(self.text)
+        self.blocks = list(self.steps.values())
 
     def test_the_workflow_is_a_manual_build(self):
         self.assertIn('workflow_dispatch', self.text)
@@ -82,10 +91,9 @@ class AndroidApkWorkflowTests(unittest.TestCase):
         self.assertTrue((ROOT / 'scripts/bootstrap.py').exists())
 
     def test_build_options_are_ones_the_build_script_parses(self):
-        build = [block for block in self.blocks if 'build_android.sh' in block]
-        self.assertEqual(len(build), 1)
+        build = self.steps['Build the APK']
         wanted = set()
-        for group in re.findall(r'args(?:\+=|=)\((.*?)\)', build[0], re.S):
+        for group in re.findall(r'args(?:\+=|=)\((.*?)\)', build, re.S):
             wanted |= set(re.findall(r'(--[a-z][a-z-]+)', group))
         self.assertEqual(wanted, {'--diagnostic', '--pack', '--abi', '--validation', '--cmake-argument'})
         parsed = set(re.findall(r'^\s+(--[a-z][a-z-]+)\)', BUILD_SCRIPT.read_text(encoding='utf-8'), re.M))
@@ -127,7 +135,7 @@ class AndroidApkWorkflowTests(unittest.TestCase):
 
     @unittest.skipUnless(SHELL, 'the steps are shell scripts')
     def test_the_sources_check_reads_the_layout_it_documents(self):
-        block = next(block for block in self.blocks if 'shaders.pack' in block and 'missing' in block)
+        block = self.steps['Check the game code and the shader pack']
         values = {'inputs.game_directory': 'out/recomp/diagnostic',
                   'inputs.shaders_pack': 'out/shaders/shaders.pack'}
         with tempfile.TemporaryDirectory() as directory:
@@ -151,7 +159,7 @@ class AndroidApkWorkflowTests(unittest.TestCase):
 
     @unittest.skipUnless(SHELL, 'the steps are shell scripts')
     def test_the_apk_check_reads_a_packaged_apk(self):
-        block = next(block for block in self.blocks if 'aapt2' in block)
+        block = self.steps['Check the APK']
         libraries = ('libmain.so', 'liblauncher.so', 'libSDL2.so', 'libc++_shared.so')
         entries = ['classes.dex', 'assets/shaders.pack']
         entries += ['lib/arm64-v8a/' + library for library in libraries]
@@ -192,9 +200,161 @@ class AndroidApkWorkflowTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn('has no lib/arm64-v8a/liblauncher.so', result.stdout)
 
+    def test_the_runner_installs_what_it_builds_with(self):
+        # Nothing is taken for granted from the image: the SDK, its components,
+        # the NDK and the build tools are all installed by these steps.
+        for action in ('android-actions/setup-android@', 'actions/setup-java@', 'actions/setup-python@'):
+            self.assertIn(action, self.text)
+        for step in ('Install CMake, Ninja and ccache', 'Install the SDK components and the NDK'):
+            self.assertIn(step, self.steps, step)
+
+    @unittest.skipUnless(SHELL, 'the steps are shell scripts')
+    def test_the_build_tools_step_installs_only_what_is_missing(self):
+        block = self.steps['Install CMake, Ninja and ccache']
+        cases = [
+            # (what PATH holds, cmake version, what has to be installed)
+            ({'cmake': '3.31.6', 'ninja': None, 'ccache': None, 'unzip': None}, None),
+            ({'cmake': '3.22.1', 'ninja': None, 'ccache': None, 'unzip': None}, None),
+            # CMakeLists.txt asks for 3.20, so an older one is replaced.
+            ({'cmake': '3.18.4', 'ninja': None, 'ccache': None, 'unzip': None}, 'cmake'),
+            ({'ninja': None, 'ccache': None, 'unzip': None}, 'cmake'),
+            ({'cmake': '3.31.6', 'ccache': None, 'unzip': None}, 'ninja-build'),
+            ({'cmake': '3.31.6', 'ninja': None, 'unzip': None}, 'ccache'),
+        ]
+        for present, install in cases:
+            with self.subTest(present=sorted(present), install=install), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / 'bin'
+                path.mkdir()
+                for tool, version in present.items():
+                    executable = path / tool
+                    if version:
+                        executable.write_text('#!/bin/sh\necho "%s version %s"\n' % (tool, version))
+                    else:
+                        executable.write_text('#!/bin/sh\nexit 0\n')
+                    executable.chmod(0o755)
+                # apt-get is never run here: sudo records what it was asked for.
+                sudo = path / 'sudo'
+                sudo.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "%s/packages.txt"\n' % ('%s', root))
+                sudo.chmod(0o755)
+                result = bash_step(block, directory, {},
+                                   dict(os.environ, PATH=str(path) + os.pathsep + os.environ['PATH']))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                asked = (root / 'packages.txt').read_text() if (root / 'packages.txt').exists() else ''
+                if install is None:
+                    self.assertEqual(asked, '', asked)
+                else:
+                    self.assertIn('apt-get install -y', asked)
+                    for package in install.split():
+                        self.assertIn(package, asked)
+                    for package in ('ninja-build', 'ccache', 'unzip', 'cmake'):
+                        if package not in install.split():
+                            self.assertNotIn(package, asked.split('apt-get install -y')[1])
+
+    def test_the_sdk_and_ndk_versions_are_the_ones_the_packaging_needs(self):
+        # package_android.py targets SDK 35 and reads android.jar from the
+        # newest platform there, so the workflow has to install one.
+        packaged = PACKAGING.read_text(encoding='utf-8')
+        target = re.search(r'^MIN_SDK, TARGET_SDK\s*=\s*\d+,\s*(\d+)', packaged, re.M).group(1)
+        block = self.steps['Install the SDK components and the NDK']
+        platform = re.search(r'^(\s*)platform=(\S+)', block, re.M)
+        self.assertIsNotNone(platform, 'the step does not name a platform')
+        self.assertEqual(platform.group(2), target)
+        tools = re.search(r'^tools=(\S+)', block, re.M).group(1)
+        self.assertTrue(tools.startswith(target + '.'), tools)
+        # The pinned NDK is the one docs/android.md says was verified.
+        ndk = re.search(r'ndk="\$\{WANTED_NDK:-(\S+)\}"', block).group(1)
+        self.assertRegex(ndk, r'^2[7-9]\.\d+\.\d+$', ndk)
+        self.assertIn(ndk, (ROOT / 'docs/android.md').read_text(encoding='utf-8'))
+
+    @unittest.skipUnless(SHELL, 'the steps are shell scripts')
+    def test_the_sdk_step_installs_what_the_scripts_read(self):
+        """The step against a stub sdkmanager: it installs, then checks each tool."""
+        block = self.steps['Install the SDK components and the NDK']
+        stub = r'''#!/bin/sh
+# A stand-in for sdkmanager: it records every package asked for and writes the
+# files a real install would leave behind.
+printf '%s\n' "$*" >> "${ANDROID_HOME:?}/installed.txt"
+[ "$1" = --install ] || exit 0
+shift
+for package in "$@"; do
+  case "$package" in
+    platforms\;android-*)
+      directory="$ANDROID_HOME/${package%;*}/${package#*;}"
+      mkdir -p "$directory" && : > "$directory/android.jar";;
+    build-tools\;*)
+      directory="$ANDROID_HOME/${package%;*}/${package#*;}"
+      mkdir -p "$directory"
+      for tool in aapt2 d8 zipalign apksigner; do
+        : > "$directory/$tool" && chmod +x "$directory/$tool"
+      done;;
+    ndk\;*)
+      directory="$ANDROID_HOME/${package%;*}/${package#*;}"
+      mkdir -p "$directory/build/cmake" "$directory/toolchains/llvm/prebuilt/linux-x86_64/bin"
+      : > "$directory/build/cmake/android.toolchain.cmake"
+      : > "$directory/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+      chmod +x "$directory/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+      for triple in aarch64-linux-android x86_64-linux-android; do
+        mkdir -p "$directory/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple"
+        : > "$directory/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/libc++_shared.so"
+      done
+      printf 'Pkg.Revision = 29.0.13599879\n' > "$directory/source.properties";;
+    *) echo "unexpected package $package" >&2; exit 1;;
+  esac
+done
+'''
+        for case, on_path in (('every tool is installed', True), ('cmake is missing', False)):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                sdk = root / 'sdk'
+                (sdk / 'cmdline-tools/latest/bin').mkdir(parents=True)
+                manager = sdk / 'cmdline-tools/latest/bin/sdkmanager'
+                manager.write_text(stub)
+                manager.chmod(0o755)
+                path = root / 'bin'
+                path.mkdir()
+                # Only the tools the step looks for on PATH; coreutils and the
+                # shell's own built-ins are the real ones.
+                for tool in ('java', 'javac', 'keytool', 'python', 'cmake', 'ninja', 'unzip', 'git'):
+                    if tool == 'cmake' and not on_path:
+                        continue
+                    executable = path / tool
+                    executable.write_text('#!/bin/sh\nexit 0\n')
+                    executable.chmod(0o755)
+                environment = dict(os.environ, PATH=str(path) + os.pathsep + os.environ['PATH'],
+                                   ANDROID_HOME=str(sdk), WANTED_NDK='',
+                                   GITHUB_ENV=str(root / 'github_env'))
+                result = bash_step(block, directory, {}, environment)
+                if not on_path:
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn('were not installed', result.stdout)
+                    self.assertIn('cmake (on PATH)', result.stdout)
+                    continue
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                installed = (sdk / 'installed.txt').read_text()
+                for package in ('platforms;android-35', 'build-tools;35.0.0', 'ndk;29.0.13599879'):
+                    self.assertIn(package, installed)
+                self.assertIn('NDK 29.0.13599879', result.stdout)
+                environment_lines = (root / 'github_env').read_text()
+                self.assertIn('ANDROID_HOME=%s' % sdk, environment_lines)
+                self.assertIn('SFR_ANDROID_NDK=%s/ndk/29.0.13599879' % sdk, environment_lines)
+
+    @unittest.skipUnless(SHELL, 'the steps are shell scripts')
+    def test_the_sdk_step_stops_when_there_is_no_sdkmanager(self):
+        block = self.steps['Install the SDK components and the NDK']
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = dict(os.environ, ANDROID_HOME=str(root / 'empty-sdk'), WANTED_NDK='',
+                               PATH=str(root / 'nowhere') + os.pathsep + '/usr/bin:/bin',
+                               GITHUB_ENV=str(root / 'github_env'))
+            result = bash_step(block, directory, {}, environment)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('No Android sdkmanager', result.stdout)
+
     @unittest.skipUnless(SHELL, 'the steps are shell scripts')
     def test_the_build_step_hands_the_build_script_its_inputs(self):
-        block = next(block for block in self.blocks if 'build_android.sh' in block)
+        block = self.steps['Build the APK']
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'scripts').mkdir()

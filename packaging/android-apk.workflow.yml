@@ -37,7 +37,7 @@ on:
         description: 'minimum Android API level (28 or newer)'
         default: '28'
       ndk:
-        description: 'NDK version to use (empty: the newest the runner has)'
+        description: 'NDK version (empty: the pinned 29.0.13599879, installed here)'
         default: ''
       validation:
         description: 'build with the Vulkan validation layers'
@@ -139,41 +139,144 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Choose the NDK
-        env:
-          WANTED: ${{ inputs.ndk }}
-        run: |
-          [ -n "$WANTED" ] || exit 0
-          # The image ships one NDK per release; ask the SDK manager for another
-          # only when the requested version is not already there.
-          if [ ! -d "$ANDROID_HOME/ndk/$WANTED" ]; then
-            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$WANTED"
-          fi
-          echo "SFR_ANDROID_NDK=$ANDROID_HOME/ndk/$WANTED" >> "$GITHUB_ENV"
+      # The command line tools, so that sdkmanager is there even on an image
+      # without an SDK. It accepts the licences and puts sdkmanager on PATH.
+      - name: Set up the Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Make room and install the build tools
+      - name: Install CMake, Ninja and ccache
+        run: |
+          # build_android.sh drives the NDK with CMake and Ninja; ccache is the
+          # compiler launcher (below); unzip reads the APK that is built.
+          packages=()
+          if ! command -v cmake > /dev/null; then
+            packages+=(cmake)
+          else
+            version="$(cmake --version | sed -n 's/^cmake version \([0-9]*\.[0-9]*\).*/\1/p')"
+            # CMake 3.20 is what CMakeLists.txt asks for.
+            if [ -z "$version" ] || [ "$(printf '3.20\n%s\n' "$version" | sort -V | head -1)" != 3.20 ]; then
+              packages+=(cmake)
+            fi
+          fi
+          # tool:package, for the ones whose package is named differently.
+          for pair in ninja:ninja-build ccache:ccache unzip:unzip; do
+            command -v "${pair%%:*}" > /dev/null || packages+=("${pair#*:}")
+          done
+          if [ ${#packages[@]} -gt 0 ]; then
+            sudo apt-get update
+            sudo apt-get install -y "${packages[@]}"
+          fi
+          # What is there in the end, for the log.
+          for tool in cmake ninja ccache unzip; do
+            if command -v "$tool" > /dev/null; then
+              echo "$tool: $("$tool" --version | head -1)"
+            else
+              echo "$tool: not found"
+            fi
+          done
+
+      - name: Install the SDK components and the NDK
+        env:
+          WANTED_NDK: ${{ inputs.ndk }}
+        run: |
+          # Everything the two scripts need, installed and then checked:
+          #   platform $platform    scripts/package_android.py: android.jar, aapt2 link
+          #   build-tools $tools    aapt2, d8, zipalign, apksigner
+          #   ndk $NDK              scripts/build_android.sh: the toolchain file,
+          #                         llvm-strip and libc++_shared.so
+          platform=35
+          tools=35.0.0
+          ndk="${WANTED_NDK:-29.0.13599879}"
+          root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
+          mkdir -p "$root"
+          # Later steps (both scripts read ANDROID_HOME) and this one.
+          echo "ANDROID_HOME=$root" >> "$GITHUB_ENV"
+          export ANDROID_HOME="$root"
+          manager=""
+          for candidate in "$root"/cmdline-tools/*/bin/sdkmanager "$root"/tools/bin/sdkmanager; do
+            [ -x "$candidate" ] && manager="$candidate"
+          done
+          if [ -z "$manager" ]; then
+            manager="$(command -v sdkmanager || true)"
+          fi
+          if [ -z "$manager" ]; then
+            echo "::error::No Android sdkmanager: install the SDK command line tools on this runner."
+            exit 1
+          fi
+          wanted=()
+          [ -f "$root/platforms/android-$platform/android.jar" ] ||
+            wanted+=("platforms;android-$platform")
+          for tool in aapt2 d8 zipalign apksigner; do
+            if [ ! -x "$root/build-tools/$tools/$tool" ]; then
+              wanted+=("build-tools;$tools")
+              break
+            fi
+          done
+          [ -f "$root/ndk/$ndk/build/cmake/android.toolchain.cmake" ] || wanted+=("ndk;$ndk")
+          if [ ${#wanted[@]} -gt 0 ]; then
+            echo "Installing: ${wanted[*]}"
+            # sdkmanager asks for the licences on stdin. The answers are finite
+            # on purpose: an endless `yes` leaves the pipeline with SIGPIPE
+            # (141) under -o pipefail, which GitHub's bash uses, and that would
+            # fail the step even after a good install.
+            answers="$(printf 'y\n%.0s' $(seq 1 500))"
+            printf '%s' "$answers" | "$manager" --licenses > /dev/null || true
+            status=0
+            printf '%s' "$answers" | "$manager" --install "${wanted[@]}" || status=$?
+            if [ "$status" -ne 0 ] && [ "$status" -ne 141 ]; then
+              echo "::warning::sdkmanager --install exited $status; accepting the licences and trying again."
+              printf '%s' "$answers" | "$manager" --licenses > /dev/null || true
+              # Whether it worked is decided by the check below, not this status.
+              printf '%s' "$answers" | "$manager" --install "${wanted[@]}" || true
+            fi
+          fi
+          # What the build then reads, every one of it named if it is not there.
+          missing=()
+          check() { [ -e "$1" ] || missing+=("$1"); }
+          check "$root/platforms/android-$platform/android.jar"
+          for tool in aapt2 d8 zipalign apksigner; do
+            check "$root/build-tools/$tools/$tool"
+          done
+          check "$root/ndk/$ndk/build/cmake/android.toolchain.cmake"
+          prebuilt="$(ls -d "$root"/ndk/"$ndk"/toolchains/llvm/prebuilt/* 2> /dev/null | head -1)"
+          [ -n "$prebuilt" ] || missing+=("$root/ndk/$ndk/toolchains/llvm/prebuilt/")
+          if [ -n "$prebuilt" ]; then
+            check "$prebuilt/bin/llvm-strip"
+            # One for each ABI the workflow can build.
+            for triple in aarch64-linux-android x86_64-linux-android; do
+              check "$prebuilt/sysroot/usr/lib/$triple/libc++_shared.so"
+            done
+          fi
+          for tool in java javac keytool python cmake ninja unzip git; do
+            command -v "$tool" > /dev/null || missing+=("$tool (on PATH)")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::These are needed and were not installed:"
+            printf '  %s\n' "${missing[@]}"
+            exit 1
+          fi
+          revision="$(sed -n 's/^Pkg.Revision *= *//p' "$root/ndk/$ndk/source.properties")"
+          case "$revision" in
+            2[7-9].*|[3-9][0-9].*) ;;
+            *) echo "::warning::NDK $revision is older than the 27 this project needs; the ndk input" \
+                    "names another version.";;
+          esac
+          echo "platforms: $(ls "$root/platforms")"
+          echo "build-tools: $(ls "$root/build-tools")"
+          echo "NDK $revision at $root/ndk/$ndk"
+          echo "SFR_ANDROID_NDK=$root/ndk/$ndk" >> "$GITHUB_ENV"
+
+      - name: Make room
         run: |
           # The image carries several NDKs (GBs each) and host toolchains the
-          # build does not use; the generated game code and its objects need
-          # the room, and only one NDK is used.
-          if [ -n "${SFR_ANDROID_NDK:-}" ]; then
-            keep="$(readlink -f "$SFR_ANDROID_NDK")"
-          else
-            keep="$(readlink -f "${ANDROID_NDK_LATEST_HOME:?the runner image sets ANDROID_NDK_LATEST_HOME}")"
-          fi
+          # build does not use; the generated code and its objects need the
+          # room. Only the NDK chosen above stays, so "Make room" has to run
+          # after it.
+          keep="$(readlink -f "${SFR_ANDROID_NDK:?the NDK step writes SFR_ANDROID_NDK}")"
           for ndk in "$ANDROID_HOME"/ndk/*; do
             [ "$(readlink -f "$ndk")" = "$keep" ] || sudo rm -rf "$ndk"
           done
           sudo rm -rf "$ANDROID_HOME/emulator" /usr/share/dotnet
-          sudo apt-get update
-          sudo apt-get install -y ninja-build ccache
-          revision="$(sed -n 's/^Pkg.Revision *= *//p' "$keep/source.properties")"
-          echo "NDK $revision at $keep"
-          case "$revision" in
-            2[7-9].*|[3-9][0-9].*) ;;
-            *) echo "::warning::NDK $revision is older than the 27 this project needs;" \
-                    "set the ndk input to a newer version.";;
-          esac
           df -h /
 
       - name: Cache the pinned dependencies
